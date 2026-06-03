@@ -187,7 +187,7 @@ if [ ! -d "$L4T_DIR" ]; then
     # Configure default user (jetson/jetson)
     echo "Setting up login credentials..."
     sudo "$L4T_DIR/tools/l4t_create_default_user.sh" \
-        -u jetson -p jetson -n jetson -a --accept-license
+        -u sb -p sb -n sb-jetson -a --accept-license
 
     # Provision rootfs (optional — install additional packages, debs, etc.)
     if [ "$PROVISION" -eq 1 ]; then
