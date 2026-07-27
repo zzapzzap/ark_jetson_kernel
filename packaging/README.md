@@ -42,7 +42,7 @@ git tag -a pab-6.2.1.1 -m "pab-6.2.1.1"
 git push origin pab-6.2.1.1
 ```
 
-CI will build the kernel, generate the flash package, and publish the release. Monitor progress at https://github.com/ARK-Electronics/ark_jetson_kernel/actions.
+CI will build the kernel, generate the flash package, and create the release. Monitor progress at https://github.com/ARK-Electronics/ark_jetson_kernel/actions.
 
 ### Releasing all products at the same version
 
@@ -63,25 +63,28 @@ After running `build.sh`, generate a flash package locally:
 ./packaging/generate_flash_package.sh PAB
 ```
 
-No Jetson needs to be connected. The package includes DTBs for all module variants (Orin Nano 4GB/8GB, Orin NX 8GB/16GB) — the correct one is selected automatically at flash time.
+No Jetson needs to be connected to generate the package. It is the staged
+`Linux_for_Tegra` tree (minus the kernel build sources), which NVIDIA's initrd
+flasher consumes directly. Because the flasher reads the connected module's
+EEPROM at flash time, a single package flashes **all** Orin Nano/NX variants
+(4GB/8GB/16GB) — it selects both the kernel DTB and the bootloader/SDRAM config
+to match the attached module. There is no per-SKU build, so one release per
+carrier covers every module variant.
+
+The package also records the product's default camera overlay(s) (`products/<TARGET>/default_overlays`) in its `ark_flash.conf`; `flash_from_package.sh` bakes them into the DTB at flash time, same as `./flash.sh`.
+
+> This replaces the older massflash (`mfi`) package, which had to pre-bake a single `BOARDSKU` and could therefore flash only one variant — NVIDIA massflash requires every unit to be identical hardware (`tools/kernel_flash/README_initrd_flash.txt`). The trade-off: the flasher builds the flash images on the flashing host, which adds several minutes per run — but `flash_from_package.sh` reuses the previous run's images when the connected module is the same variant, so repeat flashes skip the rebuild.
 
 The output is saved to the project root, e.g. `ark-pab-nvme-super.tar.gz`.
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `--sdcard` | Generate a package for SD card instead of NVMe |
-| `--no-super` | Target the non-super module variant |
 
 If the package exceeds 2GB (the GitHub Releases per-file limit), it is automatically split into 1.9GB parts in a `_split/` directory.
 
 ## Flashing from a Release (customer)
 
-Download and run the flash script:
+Download the flasher from `main` and run it:
 
 ```
-curl -LO https://github.com/ARK-Electronics/ark_jetson_kernel/releases/download/pab-6.2.1.1/flash_from_package.sh
+curl -LO https://raw.githubusercontent.com/ARK-Electronics/ark_jetson_kernel/main/packaging/flash_from_package.sh
 chmod +x flash_from_package.sh
 ./flash_from_package.sh pab-6.2.1.1
 ```
@@ -95,3 +98,5 @@ Or flash the latest release for a product:
 The script downloads the package, extracts it, waits for a Jetson in recovery mode, and flashes. No build tools or kernel source needed — just a Debian/Ubuntu host with USB.
 
 Each version is cached in `~/.ark-jetson-cache/<tag>/` so re-running after a failure or switching between versions doesn't re-download.
+
+When flashing several units back to back (e.g. on the production line), the script also reuses the flash images built by the previous run: the module variant is identified from its recovery-mode USB product ID (instantly, with no device interaction) and, if it matches the variant the images were built for, the script flashes with `--flash-only`, skipping the ~5 min image build. Orin Nano 8GB additionally gets an EEPROM probe (~20 s plus a wait for the module to reset) because two module SKUs share its USB ID. A different module variant regenerates automatically, and `--full` forces regeneration.

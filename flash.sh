@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Usage: ./flash.sh <TARGET> [--sdcard] [--usb] [--no-super]
+# Usage: ./flash.sh <TARGET> [--sdcard] [--usb]
 #
 # TARGET: PAB | JAJ | PAB_V3
 #
@@ -26,12 +26,9 @@ while [[ $# -gt 0 ]]; do
         --usb)
             STORAGE_DEV="sda"
             shift ;;
-        --no-super)
-            FLASH_TARGET="jetson-orin-nano-devkit"
-            shift ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: ./flash.sh <PAB | JAJ | PAB_V3> [--sdcard] [--usb] [--no-super]" >&2
+            echo "Usage: ./flash.sh <PAB | JAJ | PAB_V3> [--sdcard] [--usb]" >&2
             exit 1 ;;
     esac
 done
@@ -51,7 +48,7 @@ if [ -z "$TARGET" ]; then
         esac
     else
         echo "ERROR: target required (PAB | JAJ | PAB_V3) when running non-interactively." >&2
-        echo "Usage: ./flash.sh <PAB | JAJ | PAB_V3> [--sdcard] [--usb] [--no-super]" >&2
+        echo "Usage: ./flash.sh <PAB | JAJ | PAB_V3> [--sdcard] [--usb]" >&2
         exit 1
     fi
 fi
@@ -62,7 +59,10 @@ source "$SCRIPT_DIR/scripts/check_bsp.sh"
 
 L4T_DIR="$SCRIPT_DIR/staging/$TARGET/Linux_for_Tegra"
 
-exec > >(tee "$SCRIPT_DIR/staging/$TARGET/flash.log.txt") 2>&1
+# staging/ is root-owned (created by the build container), so the user can't write
+# the log here. Flashing needs root anyway: prime sudo and tee through it.
+sudo -v || { echo "ERROR: sudo is required to flash." >&2; exit 1; }
+exec > >(sudo tee "$SCRIPT_DIR/staging/$TARGET/flash.log.txt") 2>&1
 
 if [ ! -d "$L4T_DIR" ]; then
     echo "ERROR: staging/$TARGET/ not found." >&2
@@ -76,6 +76,34 @@ if [ ! -f "$L4T_DIR/kernel/Image" ]; then
     echo "ERROR: Kernel Image not found in staging/$TARGET/." >&2
     echo "       Run ./build.sh $TARGET first." >&2
     exit 1
+fi
+
+# ── Resolve product default device-tree overlay(s) to bake into the image ────
+# Some products ship a default camera (e.g. PAB = quad IMX219). We hand its dtbo
+# to tegraflash via ADDITIONAL_DTB_OVERLAY, which appends it to OVERLAY_DTB_FILE so
+# it is merged into the base DTB *at flash time* — on top of whichever Orin Nano/NX
+# SKU the flasher detects, so one image still covers every SKU and the camera is
+# live on the first boot with no jetson-io step. The bootloader hands that merged
+# DTB to the kernel; an extlinux OVERLAYS line would instead be applied to the
+# symbol-stripped UEFI DTB and silently fail to resolve. jetson-io can still switch
+# cameras later: it boots its own FDT'd entry off the clean /boot/dtb kernel DTB,
+# which supersedes this with no duplicate-node collision. Each dtbo must have been
+# built into kernel/dtb/ by build.sh; fail loud if not.
+DEFAULT_OVERLAYS_FILE="$SCRIPT_DIR/products/$TARGET/default_overlays"
+ADDITIONAL_DTB_OVERLAY=""
+if [ -f "$DEFAULT_OVERLAYS_FILE" ]; then
+    while IFS= read -r name; do
+        name="${name%%#*}"
+        name="$(echo "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -z "$name" ] && continue
+        if [ ! -f "$L4T_DIR/kernel/dtb/$name" ]; then
+            echo "ERROR: default overlay '$name' (from $DEFAULT_OVERLAYS_FILE) is not in" >&2
+            echo "       staging/$TARGET/Linux_for_Tegra/kernel/dtb/ — rebuild with ./build.sh $TARGET" >&2
+            echo "       (is it listed in products/$TARGET/overlay/dtbo.list?)." >&2
+            exit 1
+        fi
+        ADDITIONAL_DTB_OVERLAY="${ADDITIONAL_DTB_OVERLAY:+$ADDITIONAL_DTB_OVERLAY,}$name"
+    done < "$DEFAULT_OVERLAYS_FILE"
 fi
 
 GIT_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
@@ -112,14 +140,37 @@ while true; do
     sleep 1
 done
 
+# NetworkManager must not touch the flash-time USB NIC: host profiles matched on
+# the gadget drivers (ark-jetson-usb) auto-activate on the initrd's rndis/ncm
+# interface and tear down the flasher's NFS link mid-write. Mark those drivers
+# unmanaged for the duration of the flash.
+NM_FLASH_GUARD=/etc/NetworkManager/conf.d/99-ark-jetson-flash-guard.conf
+if command -v nmcli > /dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    printf '[keyfile]\nunmanaged-devices+=driver:rndis_host;driver:cdc_ncm\n' | \
+        sudo tee "$NM_FLASH_GUARD" > /dev/null
+    sudo nmcli general reload
+    trap 'sudo rm -f "$NM_FLASH_GUARD"; sudo nmcli general reload' EXIT
+fi
+
 cd "$L4T_DIR"
 
+if [ -n "$ADDITIONAL_DTB_OVERLAY" ]; then
+    echo "Baking default device-tree overlay(s) into the image: $ADDITIONAL_DTB_OVERLAY"
+fi
+
+# dtbo basenames carry no spaces, so the unquoted ${var:+NAME=$var} prefix passes
+# cleanly as a single sudo environment assignment (and expands to nothing when no
+# product default is set).
 if [ "$USE_INITRD" = true ]; then
-    sudo ./tools/kernel_flash/l4t_initrd_flash.sh --external-device "$STORAGE_DEV" \
+    # l4t_initrd_flash reads ADDITIONAL_DTB_OVERLAY_OPT and forwards it to flash.sh.
+    sudo ${ADDITIONAL_DTB_OVERLAY:+ADDITIONAL_DTB_OVERLAY_OPT=$ADDITIONAL_DTB_OVERLAY} \
+        ./tools/kernel_flash/l4t_initrd_flash.sh --external-device "$STORAGE_DEV" \
         -p "-c ./bootloader/generic/cfg/flash_t234_qspi.xml" \
         -c ./tools/kernel_flash/flash_l4t_t234_nvme.xml \
-        --erase-all --showlogs --network usb0 \
+        --showlogs --network usb0 \
         "$FLASH_TARGET" "$STORAGE_DEV"
 else
-    sudo ./flash.sh "$FLASH_TARGET" "$STORAGE_DEV"
+    # Classic flash.sh reads ADDITIONAL_DTB_OVERLAY directly.
+    sudo ${ADDITIONAL_DTB_OVERLAY:+ADDITIONAL_DTB_OVERLAY=$ADDITIONAL_DTB_OVERLAY} \
+        ./flash.sh "$FLASH_TARGET" "$STORAGE_DEV"
 fi

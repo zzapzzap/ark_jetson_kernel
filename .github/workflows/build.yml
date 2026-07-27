@@ -16,9 +16,24 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    # Kernel build alone is ~70 min on a cold ccache; leave headroom for packaging
+    # (tar + parallel compress of the rootfs) and the multi-GB release upload.
+    timeout-minutes: 180
     permissions:
       contents: write
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # Above one build's object set (~1 GB) so ccache doesn't evict its own hits;
+      # the rotating ccache is the natural LRU victim under the repo's 10 GB budget.
+      CCACHE_MAXSIZE: "2G"
+      # Fresh checkouts reset mtimes and a few kernel files embed __DATE__/__TIME__;
+      # ignore those so they don't force misses.
+      CCACHE_SLOPPINESS: time_macros,include_file_ctime,include_file_mtime
+      # The bootlin toolchain is restored from its own cache each run with fresh
+      # mtimes; ccache's default compiler check is the compiler's mtime, so that alone
+      # invalidated the entire cache (observed ~1% hit rate). Hash the compiler's
+      # contents instead so hits survive a toolchain cache restore.
+      CCACHE_COMPILERCHECK: content
 
     steps:
       - name: Parse tag
@@ -50,30 +65,82 @@ jobs:
           docker-images: true
           swap-storage: false
 
+      - name: Stage build tree on /mnt
+        # staging/ (extracted rootfs + massflash images + the multi-GB mfi tarball)
+        # overran the ~49 GB free on / and crashed the runner with ENOSPC during
+        # packaging. The ephemeral /mnt has ~65 GB free and is otherwise unused, so
+        # build there. The final package + split stay in the workspace on /, where
+        # the release step globs for them.
+        run: |
+          sudo mkdir -p /mnt/staging
+          sudo chown "$(id -u):$(id -g)" /mnt/staging
+          ln -s /mnt/staging staging
+
       - name: Install prerequisites
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get update -qq
           sudo -E apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-            abootimg binfmt-support binutils cpio cpp curl \
+            abootimg binfmt-support binutils ccache cpio cpp curl \
             device-tree-compiler dosfstools \
             iproute2 iputils-ping lbzip2 libxml2-utils lz4 \
             netcat-openbsd nfs-kernel-server openssl \
-            python3-yaml qemu-user-static rsync sshpass \
+            pigz python3-yaml qemu-user-static rsync sshpass \
             udev usbutils uuid-runtime whois xmlstarlet zstd
+
+      - name: Resolve cache keys from versions.env
+        id: cachekeys
+        run: |
+          source versions.env
+          echo "bsp=${EXPECTED_BSP_RELEASE}.${EXPECTED_BSP_REVISION}" >> "$GITHUB_OUTPUT"
+          echo "toolchain=$(basename "$TOOLCHAIN_URL")" >> "$GITHUB_OUTPUT"
 
       - name: Cache bootlin toolchain
         uses: actions/cache@v4
         with:
           path: ~/l4t-gcc
-          key: l4t-gcc-${{ hashFiles('bsp_version.env') }}
+          key: l4t-gcc-${{ steps.cachekeys.outputs.toolchain }}
+
+      # The L4T BSP/rootfs/sources tarballs (~2.7 GB) are pinned by BSP version, so
+      # cache them on it — setup.sh skips any tarball already present in downloads/.
+      - name: Cache L4T BSP tarballs
+        uses: actions/cache@v4
+        with:
+          path: downloads/*.tbz2
+          key: l4t-bsp-${{ steps.cachekeys.outputs.bsp }}
+
+      # ccache across runs (kernel C is mostly hits). Rotating per-run key so each
+      # run saves an updated cache; restore-keys pulls the most recent prior one.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ steps.cachekeys.outputs.bsp }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ steps.cachekeys.outputs.bsp }}-
 
       - name: Download BSP
         run: ./setup.sh --force
 
+      - name: Reset ccache stats
+        run: ccache -z
+
       - name: Build kernel
-        run: ./build.sh ${{ steps.tag.outputs.target || 'PAB' }}
+        # Tag builds provision with the pinned ARK-OS deb; provision.sh falls back
+        # loudly to the newest published (pre)release if the pin isn't published. The
+        # draft release ships a flashable, provisioned image; promoting it to
+        # published is a GitHub toggle with no rebuild. PR/main builds only compile-check.
+        run: |
+          if [ -n "${{ steps.tag.outputs.target }}" ]; then
+            ./build.sh ${{ steps.tag.outputs.target }} --provision
+          else
+            ./build.sh PAB
+          fi
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
       - name: Generate flash package
         if: startsWith(github.ref, 'refs/tags/')
@@ -88,7 +155,7 @@ jobs:
           PRODUCT="${{ steps.tag.outputs.product }}"
           VERSION="${{ steps.tag.outputs.version }}"
 
-          source bsp_version.env
+          source versions.env
           L4T_VERSION="${EXPECTED_BSP_RELEASE}.${EXPECTED_BSP_REVISION}"
 
           PRODUCT_UPPER=$(echo "$PRODUCT" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
@@ -108,7 +175,7 @@ jobs:
             exit 1
           fi
 
-          RELEASE_FILES+=("packaging/flash_from_package.sh")
+          # The flasher isn't a release asset; it's served from main (linked in the notes below).
 
           echo "Release assets:"
           for f in "${RELEASE_FILES[@]}"; do
@@ -116,7 +183,6 @@ jobs:
           done
 
           COMMIT_SHORT=$(git rev-parse --short HEAD)
-          REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
 
           cat > /tmp/release-notes.md <<EOF
           ## ${PRODUCT_UPPER} v${VERSION}
@@ -125,8 +191,10 @@ jobs:
 
           ### Flash
 
+          Fetch the flasher from the main branch (it flashes any release):
+
           \`\`\`
-          curl -LO ${REPO_URL}/releases/download/${TAG}/flash_from_package.sh
+          curl -LO https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/flash_from_package.sh
           chmod +x flash_from_package.sh
           ./flash_from_package.sh ${TAG}
           \`\`\`
@@ -134,7 +202,9 @@ jobs:
           Put the Jetson in recovery mode before running. Requires a Debian/Ubuntu host with USB connection. Supports all Orin Nano/NX module variants.
           EOF
 
-          gh release create "$TAG" \
+          # Every release is born a hidden draft; promoting it to published is a
+          # manual GitHub toggle (same artifact, same tag — no rebuild, no rename).
+          gh release create "$TAG" --draft \
             --title "${PRODUCT_UPPER} v${VERSION}" \
             --notes-file /tmp/release-notes.md \
             "${RELEASE_FILES[@]}"
